@@ -210,7 +210,7 @@ def build_warehouse_marges(db_v, db_a):
     conn.execute("""
     CREATE VIEW Vue_Marges AS
     SELECT
-        vt.Date_CMD,
+        vt.Date_CMD          AS Date_Vente,
         vt.Annee,
         vt.Mois,
         vt.Nom_Mois,
@@ -221,38 +221,47 @@ def build_warehouse_marges(db_v, db_a):
         vc.Wilaya,
         vc.Forme_Juridique,
         vtyp.Type_Vente,
-        fv.Qte,
-        -- Prix unitaire de VENTE calcule par ligne de commande
-        ROUND(CAST(fv.Montant_HT AS REAL) / fv.Qte, 2)                         AS Prix_Vente_U,
-        -- Prix unitaire d'ACHAT : moyenne ponderee toutes commandes du produit
-        COALESCE(pa.Prix_Achat_U, 0.0)                                          AS Prix_Achat_U,
-        -- Marge unitaire et totale
-        ROUND(CAST(fv.Montant_HT AS REAL) / fv.Qte
-              - COALESCE(pa.Prix_Achat_U, 0.0), 2)                              AS Marge_U,
-        ROUND((CAST(fv.Montant_HT AS REAL) / fv.Qte
-               - COALESCE(pa.Prix_Achat_U, 0.0)) * fv.Qte, 2)                  AS Marge_Totale,
+        at2.Date_CMD         AS Date_Achat,
+        af.Fournisseur,
+        atyp.Type_Achat,
+        fv.Qte               AS Qte_Vendue,
+        fa.Qte               AS Qte_Achetee,
+        -- Prix unitaire de VENTE : par ligne de commande vente
+        ROUND(CAST(fv.Montant_HT AS REAL) / fv.Qte, 2)  AS Prix_Vente_U,
+        -- Prix unitaire d'ACHAT : par ligne de commande achat (chaque CMD gardee separement)
+        ROUND(CAST(fa.Montant_HT AS REAL) / fa.Qte, 2)  AS Prix_Achat_U,
+        -- Marge unitaire = PV - PA  (par paire de lignes vente/achat)
+        ROUND(
+            CAST(fv.Montant_HT AS REAL) / fv.Qte
+          - CAST(fa.Montant_HT AS REAL) / fa.Qte, 2
+        )                                                AS Marge_U,
+        -- Marge totale sur les quantites vendues
+        ROUND((
+            CAST(fv.Montant_HT AS REAL) / fv.Qte
+          - CAST(fa.Montant_HT AS REAL) / fa.Qte
+        ) * fv.Qte, 2)                                   AS Marge_Totale,
         -- Taux de marge
         ROUND(
             CASE WHEN fv.Montant_HT = 0 THEN 0
-                 ELSE (CAST(fv.Montant_HT AS REAL) / fv.Qte
-                       - COALESCE(pa.Prix_Achat_U, 0.0))
-                      / (CAST(fv.Montant_HT AS REAL) / fv.Qte) * 100
+                 ELSE (
+                     CAST(fv.Montant_HT AS REAL) / fv.Qte
+                   - CAST(fa.Montant_HT AS REAL) / fa.Qte
+                 ) / (CAST(fv.Montant_HT AS REAL) / fv.Qte) * 100
             END, 2
-        )                                                                        AS Taux_Marge
+        )                                                AS Taux_Marge
     FROM V_Fait_Ventes  fv
     JOIN V_Dim_Temps    vt   ON fv.ID_Temps   = vt.ID_Temps
     JOIN V_Dim_Produit  vp   ON fv.ID_Produit = vp.ID_Produit
     JOIN V_Dim_Client   vc   ON fv.ID_Client  = vc.ID_Client
     JOIN V_Dim_Type     vtyp ON fv.ID_Type    = vtyp.ID_Type
-    -- Sous-requete : prix d'achat moyen pondere par produit (toutes commandes)
-    LEFT JOIN (
-        SELECT
-            ap.Code_Produit,
-            ROUND(SUM(CAST(fa.Montant_HT AS REAL)) / SUM(fa.Qte), 2) AS Prix_Achat_U
-        FROM A_Fait_Achats fa
-        JOIN A_Dim_Produit ap ON fa.ID_Produit = ap.ID_Produit
-        GROUP BY ap.Code_Produit
-    ) pa ON vp.Code_Produit = pa.Code_Produit
+    -- Jointure directe ligne-a-ligne par Code_Produit
+    -- chaque commande achat garde son propre prix unitaire
+    JOIN A_Fait_Achats  fa   ON 1=1
+    JOIN A_Dim_Produit  ap   ON fa.ID_Produit      = ap.ID_Produit
+                             AND ap.Code_Produit   = vp.Code_Produit
+    JOIN A_Dim_Temps    at2  ON fa.ID_Temps        = at2.ID_Temps
+    JOIN A_Dim_Fournisseur af  ON fa.ID_Fournisseur = af.ID_Fournisseur
+    JOIN A_Dim_Type     atyp ON fa.ID_Type         = atyp.ID_Type
     """)
     conn.commit()
     conn.close()
@@ -265,7 +274,8 @@ def load_marges(db):
     conn = sqlite3.connect(db)
     df = pd.read_sql_query("SELECT * FROM Vue_Marges", conn)
     conn.close()
-    df["Date_CMD"] = pd.to_datetime(df["Date_CMD"])
+    df["Date_Vente"] = pd.to_datetime(df["Date_Vente"])
+    df["Date_Achat"] = pd.to_datetime(df["Date_Achat"])
     return df
 
 
@@ -324,12 +334,16 @@ def section_marges(df_m):
         all_prod = sorted(df_m["Produit"].dropna().unique().tolist())
         sel_prod = st.multiselect("Produit(s)", all_prod, default=all_prod, key="m_prod")
 
+        all_fourn = sorted(df_m["Fournisseur"].dropna().unique().tolist())
+        sel_fourn = st.multiselect("Fournisseur(s)", all_fourn, default=all_fourn, key="m_fourn")
+
     # Appliquer les filtres
     mask = (
         df_m["Annee"].isin(sel_ann if sel_ann else all_ann) &
         df_m["Categorie"].isin(sel_cat if sel_cat else all_cat) &
         df_m["Wilaya"].isin(sel_wil if sel_wil else all_wil) &
-        df_m["Produit"].isin(sel_prod if sel_prod else all_prod)
+        df_m["Produit"].isin(sel_prod if sel_prod else all_prod) &
+        df_m["Fournisseur"].isin(sel_fourn if sel_fourn else all_fourn)
     )
     dff = df_m[mask].copy()
 
@@ -347,7 +361,7 @@ def section_marges(df_m):
     st.markdown("---")
 
     # ── Parametres du graphique ──────────────────────────────
-    DIMS = ["Produit", "Categorie", "Wilaya", "Nom_Mois", "Annee", "Type_Vente"]
+    DIMS = ["Produit", "Categorie", "Wilaya", "Nom_Mois", "Annee", "Type_Vente", "Fournisseur", "Type_Achat"]
     INDICATEURS = {
         "Marge Totale (DA)":    "Marge_Totale",
         "Marge Unitaire (DA)": "Marge_U",
@@ -384,8 +398,8 @@ def section_marges(df_m):
         # taux = marge_totale / (prix_vente * qte) * 100
         agg = dff.groupby(grp_cols).apply(
             lambda g: pd.Series({
-                "Taux_Marge": (g["Marge_Totale"].sum() / (g["Prix_Vente_U"] * g["Qte"]).sum() * 100)
-                              if (g["Prix_Vente_U"] * g["Qte"]).sum() != 0 else 0
+                "Taux_Marge": (g["Marge_Totale"].sum() / (g["Prix_Vente_U"] * g["Qte_Vendue"]).sum() * 100)
+                              if (g["Prix_Vente_U"] * g["Qte_Vendue"]).sum() != 0 else 0
             })
         ).reset_index()
     else:
@@ -429,7 +443,8 @@ def section_marges(df_m):
         fig = px.scatter(
             dff, x=axe_x, y=ind_col,
             color=color_col, facet_col=fc, facet_row=fr,
-            title=title, size="Qte", hover_data=["Produit", "Client", "Wilaya"],
+            title=title, size="Qte_Vendue",
+            hover_data=["Produit", "Client", "Wilaya", "Prix_Vente_U", "Prix_Achat_U", "Fournisseur"],
             labels={ind_col: indicateur},
         )
 
@@ -465,9 +480,11 @@ def section_marges(df_m):
 
     # ── Tableau de detail ────────────────────────────────────
     with st.expander("Voir le tableau de donnees"):
-        show_cols = ["Produit", "Categorie", "Wilaya", "Annee", "Nom_Mois",
-                        "Type_Vente", "Qte", "Prix_Vente_U", "Prix_Achat_U",
-                        "Marge_U", "Marge_Totale", "Taux_Marge"]
+        show_cols = ["Date_Vente", "Date_Achat", "Produit", "Categorie", "Wilaya",
+                     "Annee", "Nom_Mois", "Type_Vente", "Fournisseur", "Type_Achat",
+                     "Qte_Vendue", "Qte_Achetee",
+                     "Prix_Vente_U", "Prix_Achat_U",
+                     "Marge_U", "Marge_Totale", "Taux_Marge"]
         st.dataframe(
             dff[[c for c in show_cols if c in dff.columns]]
             .sort_values("Marge_Totale", ascending=False)
