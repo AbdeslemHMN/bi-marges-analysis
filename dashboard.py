@@ -177,37 +177,95 @@ def fmt(n):
 
 
 # ─────────────────────────────────────────────────────────────
-# FUSION — MARGES (Ventes JOIN Achats sur Code_Produit)
+# FUSION — MARGES : warehouse_marges.db + Vue_Marges (VIEW SQL)
 # ─────────────────────────────────────────────────────────────
-@st.cache_data
-def load_marges(_df_v, _df_a):
-    """Fusionne Ventes et Achats sur Code_Produit pour calculer la Marge unitaire.
-    Marge = Prix_Vente_Unitaire - Prix_Achat_Unitaire
+@st.cache_resource
+def build_warehouse_marges(db_v, db_a):
+    """Cree warehouse_marges.db :
+    - Copie les tables des deux entrepots (prefixes V_ et A_)
+    - Cree la Vue_Marges (VIEW) qui fait la jointure et calcule
+      le prix unitaire par ligne de commande (pas en moyenne globale)
     """
-    # Prix unitaire de vente : Montant_HT / Qte
-    pv = (
-        _df_v.groupby("Code_Produit")
-        .apply(lambda g: (g["Montant_HT"].sum() / g["Qte"].sum()))
-        .reset_index()
-    )
-    pv.columns = ["Code_Produit", "Prix_Vente_U"]
+    db = str(BASE_DIR / "warehouse_marges.db")
+    conn = sqlite3.connect(db)
 
-    # Prix unitaire d'achat : Montant_HT / Qte
-    pa = (
-        _df_a.groupby("Code_Produit")
-        .apply(lambda g: (g["Montant_HT"].sum() / g["Qte"].sum()))
-        .reset_index()
-    )
-    pa.columns = ["Code_Produit", "Prix_Achat_U"]
+    # -- Copier tables Ventes --
+    conn_v = sqlite3.connect(db_v)
+    for tbl in ["Fait_Ventes", "Dim_Client", "Dim_Produit", "Dim_Temps", "Dim_Type"]:
+        pd.read_sql_query(f"SELECT * FROM {tbl}", conn_v).to_sql(
+            f"V_{tbl}", conn, if_exists="replace", index=False
+        )
+    conn_v.close()
 
-    # On part des lignes de vente pour conserver toutes les dimensions
-    df = _df_v.copy()
-    df = df.merge(pv, on="Code_Produit")
-    df = df.merge(pa, on="Code_Produit", how="left")
-    df["Prix_Achat_U"] = df["Prix_Achat_U"].fillna(0)
-    df["Marge_U"]      = df["Prix_Vente_U"] - df["Prix_Achat_U"]
-    df["Marge_Totale"] = df["Marge_U"] * df["Qte"]
-    df["Taux_Marge"]   = (df["Marge_U"] / df["Prix_Vente_U"] * 100).round(2)
+    # -- Copier tables Achats --
+    conn_a = sqlite3.connect(db_a)
+    for tbl in ["Fait_Achats", "Dim_Fournisseur", "Dim_Produit", "Dim_Temps", "Dim_Type"]:
+        pd.read_sql_query(f"SELECT * FROM {tbl}", conn_a).to_sql(
+            f"A_{tbl}", conn, if_exists="replace", index=False
+        )
+    conn_a.close()
+
+    # -- Creer la Vue_Marges --
+    conn.execute("DROP VIEW IF EXISTS Vue_Marges")
+    conn.execute("""
+    CREATE VIEW Vue_Marges AS
+    SELECT
+        vt.Date_CMD,
+        vt.Annee,
+        vt.Mois,
+        vt.Nom_Mois,
+        vp.Code_Produit,
+        vp.Produit,
+        vp.Categorie,
+        vc.Client,
+        vc.Wilaya,
+        vc.Forme_Juridique,
+        vtyp.Type_Vente,
+        fv.Qte,
+        -- Prix unitaire de VENTE calcule par ligne de commande
+        ROUND(CAST(fv.Montant_HT AS REAL) / fv.Qte, 2)                         AS Prix_Vente_U,
+        -- Prix unitaire d'ACHAT : moyenne ponderee toutes commandes du produit
+        COALESCE(pa.Prix_Achat_U, 0.0)                                          AS Prix_Achat_U,
+        -- Marge unitaire et totale
+        ROUND(CAST(fv.Montant_HT AS REAL) / fv.Qte
+              - COALESCE(pa.Prix_Achat_U, 0.0), 2)                              AS Marge_U,
+        ROUND((CAST(fv.Montant_HT AS REAL) / fv.Qte
+               - COALESCE(pa.Prix_Achat_U, 0.0)) * fv.Qte, 2)                  AS Marge_Totale,
+        -- Taux de marge
+        ROUND(
+            CASE WHEN fv.Montant_HT = 0 THEN 0
+                 ELSE (CAST(fv.Montant_HT AS REAL) / fv.Qte
+                       - COALESCE(pa.Prix_Achat_U, 0.0))
+                      / (CAST(fv.Montant_HT AS REAL) / fv.Qte) * 100
+            END, 2
+        )                                                                        AS Taux_Marge
+    FROM V_Fait_Ventes  fv
+    JOIN V_Dim_Temps    vt   ON fv.ID_Temps   = vt.ID_Temps
+    JOIN V_Dim_Produit  vp   ON fv.ID_Produit = vp.ID_Produit
+    JOIN V_Dim_Client   vc   ON fv.ID_Client  = vc.ID_Client
+    JOIN V_Dim_Type     vtyp ON fv.ID_Type    = vtyp.ID_Type
+    -- Sous-requete : prix d'achat moyen pondere par produit (toutes commandes)
+    LEFT JOIN (
+        SELECT
+            ap.Code_Produit,
+            ROUND(SUM(CAST(fa.Montant_HT AS REAL)) / SUM(fa.Qte), 2) AS Prix_Achat_U
+        FROM A_Fait_Achats fa
+        JOIN A_Dim_Produit ap ON fa.ID_Produit = ap.ID_Produit
+        GROUP BY ap.Code_Produit
+    ) pa ON vp.Code_Produit = pa.Code_Produit
+    """)
+    conn.commit()
+    conn.close()
+    return db
+
+
+@st.cache_data
+def load_marges(db):
+    """Charge la Vue_Marges depuis warehouse_marges.db."""
+    conn = sqlite3.connect(db)
+    df = pd.read_sql_query("SELECT * FROM Vue_Marges", conn)
+    conn.close()
+    df["Date_CMD"] = pd.to_datetime(df["Date_CMD"])
     return df
 
 
@@ -216,9 +274,10 @@ def load_marges(_df_v, _df_a):
 # ─────────────────────────────────────────────────────────────
 db_v = build_warehouse_ventes()
 db_a = build_warehouse_achats()
+db_m = build_warehouse_marges(db_v, db_a)
 df_v = load_ventes(db_v)
 df_a = load_achats(db_a)
-df_m = load_marges(df_v, df_a)
+df_m = load_marges(db_m)
 
 
 # ─────────────────────────────────────────────────────────────
@@ -407,8 +466,8 @@ def section_marges(df_m):
     # ── Tableau de detail ────────────────────────────────────
     with st.expander("Voir le tableau de donnees"):
         show_cols = ["Produit", "Categorie", "Wilaya", "Annee", "Nom_Mois",
-                     "Type_Vente", "Qte", "Prix_Vente_U", "Prix_Achat_U",
-                     "Marge_U", "Marge_Totale", "Taux_Marge"]
+                        "Type_Vente", "Qte", "Prix_Vente_U", "Prix_Achat_U",
+                        "Marge_U", "Marge_Totale", "Taux_Marge"]
         st.dataframe(
             dff[[c for c in show_cols if c in dff.columns]]
             .sort_values("Marge_Totale", ascending=False)
